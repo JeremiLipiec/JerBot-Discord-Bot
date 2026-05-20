@@ -64,16 +64,34 @@ function fmtDuration(secs) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-async function playNext(guildId) {
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function scheduleIdleDisconnect(guildId) {
   const session = sessions.get(guildId);
-  if (!session || session.queue.length === 0) {
-    if (session) {
-      session.connection.destroy();
+  if (!session) return;
+  clearTimeout(session.idleTimer);
+  session.idleTimer = setTimeout(() => {
+    const s = sessions.get(guildId);
+    if (s) {
+      s.textChannel.send('No songs played for 5 minutes, disconnecting.').catch(() => {});
+      s.ytProc?.kill();
+      s.player.stop(true);
+      s.connection.destroy();
       sessions.delete(guildId);
     }
+  }, IDLE_TIMEOUT_MS);
+}
+
+async function playNext(guildId) {
+  const session = sessions.get(guildId);
+  if (!session) return;
+
+  if (session.queue.length === 0) {
+    scheduleIdleDisconnect(guildId);
     return;
   }
 
+  clearTimeout(session.idleTimer);
   const track = session.queue.shift();
   session.ytProc?.kill();
 
@@ -213,6 +231,7 @@ client.on('interactionCreate', async interaction => {
       if (!session) {
         return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
       }
+      clearTimeout(session.idleTimer);
       session.queue.length = 0;
       session.player.stop(true);
       session.ytProc?.kill();
