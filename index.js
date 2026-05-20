@@ -1,0 +1,226 @@
+require('dotenv').config();
+
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  entersState,
+  VoiceConnectionStatus,
+  StreamType,
+} = require('@discordjs/voice');
+const { create: createYtDlp } = require('yt-dlp-exec');
+const { spawn } = require('child_process');
+
+const ytDlp = createYtDlp('yt-dlp');
+const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_CHANNEL_ID } = process.env;
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('play')
+    .setDescription('Add a YouTube link to the queue and start playing')
+    .addStringOption(o => o.setName('url').setDescription('YouTube URL').setRequired(true))
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('skip')
+    .setDescription('Skip the current song')
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Stop playback, clear queue and disconnect')
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('surprise')
+    .setDescription('Play a song without revealing what it is')
+    .addStringOption(o => o.setName('url').setDescription('YouTube URL').setRequired(true))
+    .toJSON(),
+];
+
+// guildId -> { player, connection, queue, ytProc, currentTrack, textChannel }
+const sessions = new Map();
+
+async function getVideoInfo(url) {
+  return ytDlp(url, {
+    dumpSingleJson: true,
+    noWarnings: true,
+    noCheckCertificates: true,
+    preferFreeFormats: true,
+    addHeader: ['referer:youtube.com', 'user-agent:googlebot'],
+  });
+}
+
+function createYtDlpStream(url) {
+  return spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet']);
+}
+
+function fmtDuration(secs) {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+async function playNext(guildId) {
+  const session = sessions.get(guildId);
+  if (!session || session.queue.length === 0) {
+    if (session) {
+      session.connection.destroy();
+      sessions.delete(guildId);
+    }
+    return;
+  }
+
+  const track = session.queue.shift();
+  session.ytProc?.kill();
+
+  const ytProc = createYtDlpStream(track.url);
+  session.ytProc = ytProc;
+  session.currentTrack = track;
+  session.player.play(createAudioResource(ytProc.stdout, { inputType: StreamType.Arbitrary }));
+
+  const msg = track.surprise
+    ? 'Surprise song incoming! What could it be...'
+    : `Now playing: **${track.title}** [${fmtDuration(track.duration)}]`;
+  session.textChannel.send(msg).catch(() => {});
+}
+
+async function getOrCreateSession(interaction, voiceChannel) {
+  const existing = sessions.get(interaction.guildId);
+  if (existing) return existing;
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: interaction.guildId,
+    adapterCreator: interaction.guild.voiceAdapterCreator,
+  });
+
+  await entersState(connection, VoiceConnectionStatus.Ready, 15_000).catch(() => {
+    connection.destroy();
+    throw new Error('Could not connect to voice channel.');
+  });
+
+  const player = createAudioPlayer();
+  player.on(AudioPlayerStatus.Idle, () => playNext(interaction.guildId));
+  player.on('error', err => {
+    console.error('Player error:', err.message);
+    playNext(interaction.guildId);
+  });
+  connection.subscribe(player);
+
+  const session = {
+    player,
+    connection,
+    queue: [],
+    ytProc: null,
+    currentTrack: null,
+    textChannel: interaction.channel,
+  };
+  sessions.set(interaction.guildId, session);
+  return session;
+}
+
+async function handleQueue(interaction, surprise) {
+  const url = interaction.options.getString('url');
+  const voiceChannel = interaction.member?.voice?.channel;
+
+  if (!voiceChannel) {
+    return interaction.reply({ content: 'You need to join a voice channel first!', ephemeral: true });
+  }
+  if (!url.includes('youtube.com/') && !url.includes('youtu.be/')) {
+    return interaction.reply({ content: 'That is not a valid YouTube URL.', ephemeral: true });
+  }
+
+  await interaction.deferReply();
+
+  try {
+    const info = await getVideoInfo(url);
+    const track = { url, title: info.title, duration: info.duration, surprise };
+    const session = await getOrCreateSession(interaction, voiceChannel);
+    const isIdle = session.player.state.status === AudioPlayerStatus.Idle;
+    session.queue.push(track);
+
+    if (isIdle) {
+      await playNext(interaction.guildId);
+      await interaction.editReply(
+        surprise
+          ? 'Surprise song incoming! What could it be...'
+          : `Now playing: **${track.title}** [${fmtDuration(track.duration)}]`
+      );
+    } else {
+      await interaction.editReply(
+        surprise
+          ? 'Surprise song added to the queue!'
+          : `Added to queue (#${session.queue.length}): **${track.title}** [${fmtDuration(track.duration)}]`
+      );
+    }
+  } catch (err) {
+    console.error('Queue error:', err);
+    await interaction.editReply('Failed to play that video. Make sure the link is public and try again.');
+  }
+}
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+  console.log('Slash commands registered.');
+}
+
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands().catch(err => {
+    console.error('Failed to register commands:', err.message);
+    console.error('Make sure the bot was invited with the applications.commands scope.');
+  });
+});
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
+    return interaction.reply({
+      content: 'This command can only be used in the designated music channel.',
+      ephemeral: true,
+    });
+  }
+
+  switch (interaction.commandName) {
+    case 'play':
+      return handleQueue(interaction, false);
+
+    case 'surprise':
+      return handleQueue(interaction, true);
+
+    case 'skip': {
+      const session = sessions.get(interaction.guildId);
+      if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
+        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+      }
+      const label = session.currentTrack?.surprise
+        ? 'the surprise song'
+        : `**${session.currentTrack?.title ?? 'current track'}**`;
+      session.ytProc?.kill();
+      session.player.stop(true);
+      const suffix = session.queue.length > 0 ? '' : ' Queue is empty, disconnecting.';
+      return interaction.reply(`Skipped ${label}.${suffix}`);
+    }
+
+    case 'stop': {
+      const session = sessions.get(interaction.guildId);
+      if (!session) {
+        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+      }
+      session.queue.length = 0;
+      session.player.stop(true);
+      session.ytProc?.kill();
+      session.connection.destroy();
+      sessions.delete(interaction.guildId);
+      return interaction.reply('Stopped playback and disconnected.');
+    }
+  }
+});
+
+client.login(DISCORD_TOKEN);

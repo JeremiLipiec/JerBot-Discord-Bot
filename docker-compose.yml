@@ -1,0 +1,7 @@
+services:
+  wirtualnyjeremg:
+    build: .
+    container_name: jerbot
+    restart: unless-stopped
+    env_file:
+      - .env
