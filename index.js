@@ -23,8 +23,8 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Add a YouTube link to the queue and start playing')
-    .addStringOption(o => o.setName('url').setDescription('YouTube URL').setRequired(true))
+    .setDescription('Add a YouTube link or search query to the queue and start playing')
+    .addStringOption(o => o.setName('query').setDescription('YouTube URL or search query').setRequired(true))
     .toJSON(),
   new SlashCommandBuilder()
     .setName('skip')
@@ -37,28 +37,48 @@ const commands = [
   new SlashCommandBuilder()
     .setName('surprise')
     .setDescription('Play a song without revealing what it is')
-    .addStringOption(o => o.setName('url').setDescription('YouTube URL').setRequired(true))
+    .addStringOption(o => o.setName('query').setDescription('YouTube URL or search query').setRequired(true))
     .toJSON(),
 ];
 
 // guildId -> { player, connection, queue, ytProc, currentTrack, textChannel }
 const sessions = new Map();
 
-async function getVideoInfo(url) {
-  return ytDlp(url, {
+async function getVideoInfo(target) {
+  const result = await ytDlp(target, {
     dumpSingleJson: true,
     noWarnings: true,
     noCheckCertificates: true,
     preferFreeFormats: true,
+    noFlatPlaylist: true,
     addHeader: ['referer:youtube.com', 'user-agent:googlebot'],
   });
+  return result.entries?.[0] ?? result;
 }
 
 function createYtDlpStream(url) {
   return spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet']);
 }
 
+function resolveQuery(input) {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return `ytsearch1:${trimmed}`;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname === 'youtu.be') {
+      return `https://www.youtube.com/watch?v=${parsed.pathname.slice(1)}`;
+    }
+    if (parsed.hostname.includes('youtube.com') && parsed.searchParams.has('v')) {
+      return `https://www.youtube.com/watch?v=${parsed.searchParams.get('v')}`;
+    }
+  } catch {}
+  return trimmed;
+}
+
 function fmtDuration(secs) {
+  if (!secs) return '?:??';
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
@@ -142,21 +162,19 @@ async function getOrCreateSession(interaction, voiceChannel) {
 }
 
 async function handleQueue(interaction, surprise) {
-  const url = interaction.options.getString('url');
+  const input = interaction.options.getString('query');
   const voiceChannel = interaction.member?.voice?.channel;
 
   if (!voiceChannel) {
     return interaction.reply({ content: 'You need to join a voice channel first!', ephemeral: true });
   }
-  if (!url.includes('youtube.com/') && !url.includes('youtu.be/')) {
-    return interaction.reply({ content: 'That is not a valid YouTube URL.', ephemeral: true });
-  }
 
   await interaction.deferReply();
 
   try {
-    const info = await getVideoInfo(url);
-    const track = { url, title: info.title, duration: info.duration, surprise };
+    const target = resolveQuery(input);
+    const info = await getVideoInfo(target);
+    const track = { url: info.webpage_url, title: info.title, duration: info.duration, surprise };
     const session = await getOrCreateSession(interaction, voiceChannel);
     const isIdle = session.player.state.status === AudioPlayerStatus.Idle;
     session.queue.push(track);
@@ -204,6 +222,9 @@ client.on('interactionCreate', async interaction => {
       ephemeral: true,
     });
   }
+
+  const args = interaction.options.data.map(o => `${o.name}=${o.value}`).join(' ');
+  console.log(`[${new Date().toISOString()}] ${interaction.user.tag} used /${interaction.commandName}${args ? ` ${args}` : ''}`);
 
   switch (interaction.commandName) {
     case 'play':
