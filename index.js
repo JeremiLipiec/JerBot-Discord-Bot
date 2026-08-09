@@ -66,12 +66,13 @@ async function getVideoInfo(target) {
     preferFreeFormats: true,
     noFlatPlaylist: true,
     jsRuntimes: 'node',
+    remoteComponents: 'ejs:github',
   });
   return result.entries?.[0] ?? result;
 }
 
 function createYtDlpStream(url) {
-  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet', '--js-runtimes', 'node']);
+  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet', '--js-runtimes', 'node', '--remote-components', 'ejs:github']);
   proc.on('error', err => {
     console.error('yt-dlp process error:', err.message);
   });
