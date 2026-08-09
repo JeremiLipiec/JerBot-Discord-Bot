@@ -31,6 +31,18 @@ const commands = [
     .setDescription('Skip the current song')
     .toJSON(),
   new SlashCommandBuilder()
+    .setName('pause')
+    .setDescription('Pause the current song')
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('resume')
+    .setDescription('Resume the paused song')
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('spierdalaj')
+    .setDescription('Skips the current song and apologizes for playing it')
+    .toJSON(),
+  new SlashCommandBuilder()
     .setName('stop')
     .setDescription('Stop playback, clear queue and disconnect')
     .toJSON(),
@@ -43,6 +55,8 @@ const commands = [
 
 // guildId -> { player, connection, queue, ytProc, currentTrack, textChannel }
 const sessions = new Map();
+// guildId -> in-flight getOrCreateSession() promise, so concurrent calls don't create duplicate connections
+const pendingSessionCreations = new Map();
 
 async function getVideoInfo(target) {
   const result = await ytDlp(target, {
@@ -57,7 +71,11 @@ async function getVideoInfo(target) {
 }
 
 function createYtDlpStream(url) {
-  return spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet']);
+  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet']);
+  proc.on('error', err => {
+    console.error('yt-dlp process error:', err.message);
+  });
+  return proc;
 }
 
 function resolveQuery(input) {
@@ -89,24 +107,41 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 function scheduleIdleDisconnect(guildId) {
   const session = sessions.get(guildId);
   if (!session) return;
+
+  // Clear any existing timer
   clearTimeout(session.idleTimer);
-  session.idleTimer = setTimeout(() => {
-    const s = sessions.get(guildId);
-    if (s) {
-      s.textChannel.send('No songs played for 5 minutes, disconnecting.').catch(() => {});
-      s.ytProc?.kill();
-      s.player.stop(true);
-      s.connection.destroy();
-      sessions.delete(guildId);
-    }
-  }, IDLE_TIMEOUT_MS);
+
+  // Set new timer only if player is idle and queue is empty
+  if (session.player.state.status === AudioPlayerStatus.Idle && session.queue.length === 0) {
+    session.idleTimer = setTimeout(() => {
+      const s = sessions.get(guildId);
+      if (s) {
+        // Double-check the conditions before disconnecting
+        const isPlayerIdle = s.player.state.status === AudioPlayerStatus.Idle;
+        const isQueueEmpty = s.queue.length === 0;
+
+        if (isPlayerIdle && isQueueEmpty) {
+          s.textChannel.send('No songs played for 5 minutes, disconnecting.').catch(() => {});
+          s.ytProc?.kill();
+          s.player.stop(true);
+          s.connection.destroy();
+          sessions.delete(guildId);
+        }
+      }
+    }, IDLE_TIMEOUT_MS);
+  }
 }
 
 async function playNext(guildId) {
   const session = sessions.get(guildId);
   if (!session) return;
 
+  // Check if we should skip playing because there are no tracks or player is already playing
   if (session.queue.length === 0) {
+    // If the player is not idle, don't schedule disconnection yet
+    if (session.player.state.status !== AudioPlayerStatus.Idle) {
+      return;
+    }
     scheduleIdleDisconnect(guildId);
     return;
   }
@@ -130,35 +165,60 @@ async function getOrCreateSession(interaction, voiceChannel) {
   const existing = sessions.get(interaction.guildId);
   if (existing) return existing;
 
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: interaction.guildId,
-    adapterCreator: interaction.guild.voiceAdapterCreator,
-  });
+  // If another call is already creating a session for this guild, wait for
+  // it instead of racing to open a second voice connection.
+  const pending = pendingSessionCreations.get(interaction.guildId);
+  if (pending) return pending;
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 15_000).catch(() => {
-    connection.destroy();
-    throw new Error('Could not connect to voice channel.');
-  });
+  const creation = (async () => {
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: interaction.guildId,
+      adapterCreator: interaction.guild.voiceAdapterCreator,
+    });
 
-  const player = createAudioPlayer();
-  player.on(AudioPlayerStatus.Idle, () => playNext(interaction.guildId));
-  player.on('error', err => {
-    console.error('Player error:', err.message);
-    playNext(interaction.guildId);
-  });
-  connection.subscribe(player);
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000).catch(() => {
+      connection.destroy();
+      throw new Error('Could not connect to voice channel.');
+    });
 
-  const session = {
-    player,
-    connection,
-    queue: [],
-    ytProc: null,
-    currentTrack: null,
-    textChannel: interaction.channel,
-  };
-  sessions.set(interaction.guildId, session);
-  return session;
+    const player = createAudioPlayer();
+    player.on(AudioPlayerStatus.Idle, () => {
+      // Ensure we only call playNext when the session still exists
+      const session = sessions.get(interaction.guildId);
+      if (session) {
+        playNext(interaction.guildId);
+      }
+    });
+    player.on('error', err => {
+      console.error('Player error:', err.message);
+      // Ensure we only call playNext when the session still exists
+      const session = sessions.get(interaction.guildId);
+      if (session) {
+        playNext(interaction.guildId);
+      }
+    });
+    connection.subscribe(player);
+
+    const session = {
+      player,
+      connection,
+      queue: [],
+      ytProc: null,
+      currentTrack: null,
+      textChannel: interaction.channel,
+      idleTimer: null
+    };
+    sessions.set(interaction.guildId, session);
+    return session;
+  })();
+
+  pendingSessionCreations.set(interaction.guildId, creation);
+  try {
+    return await creation;
+  } finally {
+    pendingSessionCreations.delete(interaction.guildId);
+  }
 }
 
 async function handleQueue(interaction, surprise) {
@@ -178,6 +238,9 @@ async function handleQueue(interaction, surprise) {
     const session = await getOrCreateSession(interaction, voiceChannel);
     const isIdle = session.player.state.status === AudioPlayerStatus.Idle;
     session.queue.push(track);
+
+    // Clear any existing idle timer when adding new tracks
+    clearTimeout(session.idleTimer);
 
     if (isIdle) {
       await playNext(interaction.guildId);
@@ -233,6 +296,16 @@ client.on('interactionCreate', async interaction => {
     case 'surprise':
       return handleQueue(interaction, true);
 
+    case 'spierdalaj': {
+      const session = sessions.get(interaction.guildId);
+      if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
+        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+      }
+      session.ytProc?.kill();
+      session.player.stop(true);
+      return interaction.reply(`I'm very sorry :(((`);
+    }
+
     case 'skip': {
       const session = sessions.get(interaction.guildId);
       if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
@@ -245,6 +318,32 @@ client.on('interactionCreate', async interaction => {
       session.player.stop(true);
       const suffix = session.queue.length > 0 ? '' : ' Queue is empty, disconnecting.';
       return interaction.reply(`Skipped ${label}.${suffix}`);
+    }
+
+    case 'pause': {
+      const session = sessions.get(interaction.guildId);
+      const status = session?.player.state.status;
+      if (!session || status === AudioPlayerStatus.Idle) {
+        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+      }
+      if (status === AudioPlayerStatus.Paused) {
+        return interaction.reply({ content: 'Playback is already paused.', ephemeral: true });
+      }
+      session.player.pause();
+      return interaction.reply('Paused playback.');
+    }
+
+    case 'resume': {
+      const session = sessions.get(interaction.guildId);
+      const status = session?.player.state.status;
+      if (!session || status === AudioPlayerStatus.Idle) {
+        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+      }
+      if (status !== AudioPlayerStatus.Paused) {
+        return interaction.reply({ content: 'Playback is already playing.', ephemeral: true });
+      }
+      session.player.unpause();
+      return interaction.reply('Resumed playback.');
     }
 
     case 'stop': {
@@ -263,4 +362,19 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-client.login(DISCORD_TOKEN);
+	client.on('voiceStateUpdate', (oldState, newState) => {
+	  // Check if the bot was disconnected from a voice channel
+	  if (oldState.id === client.user.id && oldState.channelId && !newState.channelId) {
+	    const guildId = oldState.guild.id;
+	    const session = sessions.get(guildId);
+	    if (session) {
+	      clearTimeout(session.idleTimer);
+	      session.ytProc?.kill();
+	      session.player.stop(true);
+	      session.connection.destroy();
+	      sessions.delete(guildId);
+	    }
+	  }
+	});
+
+	client.login(DISCORD_TOKEN);

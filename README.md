@@ -25,6 +25,8 @@ The bot only responds to commands in the channel set as `ALLOWED_CHANNEL_ID`.
 | Command | Description |
 |---|---|
 | `/play <url>` | Add a YouTube link to the queue and start playing |
+| `/pause` | Pause the current song |
+| `/resume` | Resume the paused song |
 | `/skip` | Skip the current song and play the next in queue |
 | `/stop` | Stop playback, clear the queue and disconnect |
 | `/surprise <url>` | Queue a song without revealing the title to the channel |
