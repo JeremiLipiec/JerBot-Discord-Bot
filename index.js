@@ -65,12 +65,13 @@ async function getVideoInfo(target) {
     noCheckCertificates: true,
     preferFreeFormats: true,
     noFlatPlaylist: true,
+    jsRuntimes: 'node',
   });
   return result.entries?.[0] ?? result;
 }
 
 function createYtDlpStream(url) {
-  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet']);
+  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet', '--js-runtimes', 'node']);
   proc.on('error', err => {
     console.error('yt-dlp process error:', err.message);
   });
