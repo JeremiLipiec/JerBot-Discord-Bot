@@ -65,7 +65,6 @@ async function getVideoInfo(target) {
     noCheckCertificates: true,
     preferFreeFormats: true,
     noFlatPlaylist: true,
-    addHeader: ['referer:youtube.com', 'user-agent:googlebot'],
   });
   return result.entries?.[0] ?? result;
 }
@@ -329,7 +328,9 @@ client.on('interactionCreate', async interaction => {
       if (status === AudioPlayerStatus.Paused) {
         return interaction.reply({ content: 'Playback is already paused.', ephemeral: true });
       }
-      session.player.pause();
+      if (!session.player.pause()) {
+        return interaction.reply({ content: 'Could not pause right now, try again in a moment.', ephemeral: true });
+      }
       return interaction.reply('Paused playback.');
     }
 
@@ -342,7 +343,9 @@ client.on('interactionCreate', async interaction => {
       if (status !== AudioPlayerStatus.Paused) {
         return interaction.reply({ content: 'Playback is already playing.', ephemeral: true });
       }
-      session.player.unpause();
+      if (!session.player.unpause()) {
+        return interaction.reply({ content: 'Could not resume right now, try again in a moment.', ephemeral: true });
+      }
       return interaction.reply('Resumed playback.');
     }
 
