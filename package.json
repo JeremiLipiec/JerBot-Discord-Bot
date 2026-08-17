@@ -7,8 +7,10 @@
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
+    "bgutils-js": "^4.0.3",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
-    "yt-dlp-exec": "^1.0.2"
+    "jsdom": "^30.0.1",
+    "youtubei.js": "^18.0.0"
   }
 }

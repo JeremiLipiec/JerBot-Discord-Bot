@@ -10,11 +10,15 @@ const {
   VoiceConnectionStatus,
   StreamType,
 } = require('@discordjs/voice');
-const { create: createYtDlp } = require('yt-dlp-exec');
-const { spawn } = require('child_process');
+const { Readable } = require('stream');
 
-const ytDlp = createYtDlp('yt-dlp');
 const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_CHANNEL_ID } = process.env;
+
+// youtubei.js/bgutils-js are ESM-only; loaded via dynamic import in main() below.
+let yt;
+let YTNodes;
+let webPoMinter;
+let userAgent;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -53,65 +57,42 @@ const commands = [
     .toJSON(),
 ];
 
-// guildId -> { player, connection, queue, ytProc, currentTrack, textChannel }
+// guildId -> { player, connection, queue, stream, currentTrack, textChannel }
 const sessions = new Map();
 // guildId -> in-flight getOrCreateSession() promise, so concurrent calls don't create duplicate connections
 const pendingSessionCreations = new Map();
 
-async function getVideoInfo(target) {
-  const result = await ytDlp(target, {
-    dumpSingleJson: true,
-    noWarnings: true,
-    noCheckCertificates: true,
-    preferFreeFormats: true,
-    noFlatPlaylist: true,
-    jsRuntimes: 'node',
-    remoteComponents: 'ejs:github',
-  });
-  return result.entries?.[0] ?? result;
-}
-
-function createYtDlpStream(url, guildId) {
-  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--js-runtimes', 'node', '--remote-components', 'ejs:github']);
-  proc.on('error', err => {
-    console.error('yt-dlp process error:', err.message);
-  });
-
-  let stderr = '';
-  proc.stderr.on('data', chunk => {
-    stderr += chunk;
-  });
-
-  proc.on('exit', (code, signal) => {
-    // code is null when we killed it ourselves (skip/stop/track change) - that's not a failure
-    if (code === 0 || code === null) return;
-    console.error(`yt-dlp stream for ${url} exited with code ${code}:\n${stderr.trim()}`);
-
-    const session = sessions.get(guildId);
-    if (session && session.ytProc === proc) {
-      session.textChannel.send('Failed to stream that track, skipping.').catch(() => {});
-      playNext(guildId);
-    }
-  });
-
-  return proc;
-}
-
-function resolveQuery(input) {
+async function resolveVideoId(input) {
   const trimmed = input.trim();
-  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-    return `ytsearch1:${trimmed}`;
-  }
-  try {
-    const parsed = new URL(trimmed);
+
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    let parsed;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new Error('Invalid URL.');
+    }
     if (parsed.hostname === 'youtu.be') {
-      return `https://www.youtube.com/watch?v=${parsed.pathname.slice(1)}`;
+      return parsed.pathname.slice(1);
     }
-    if (parsed.hostname.includes('youtube.com') && parsed.searchParams.has('v')) {
-      return `https://www.youtube.com/watch?v=${parsed.searchParams.get('v')}`;
+    if (parsed.hostname.includes('youtube.com')) {
+      if (parsed.searchParams.has('v')) {
+        return parsed.searchParams.get('v');
+      }
+      const shortsMatch = parsed.pathname.match(/^\/shorts\/([^/]+)/);
+      if (shortsMatch) {
+        return shortsMatch[1];
+      }
     }
-  } catch {}
-  return trimmed;
+    throw new Error('Unsupported YouTube URL.');
+  }
+
+  const search = await yt.search(trimmed, { type: 'video' });
+  const video = search.results.firstOfType(YTNodes.Video);
+  if (!video) {
+    throw new Error('No results found for that search.');
+  }
+  return video.video_id;
 }
 
 function fmtDuration(secs) {
@@ -141,7 +122,7 @@ function scheduleIdleDisconnect(guildId) {
 
         if (isPlayerIdle && isQueueEmpty) {
           s.textChannel.send('No songs played for 5 minutes, disconnecting.').catch(() => {});
-          s.ytProc?.kill();
+          s.stream?.destroy();
           s.player.stop(true);
           s.connection.destroy();
           sessions.delete(guildId);
@@ -149,6 +130,24 @@ function scheduleIdleDisconnect(guildId) {
       }
     }, IDLE_TIMEOUT_MS);
   }
+}
+
+async function getAudioStream(videoId) {
+  if (!webPoMinter) {
+    throw new Error('PO token minter is not ready.');
+  }
+
+  const contentPoToken = await webPoMinter.mintAsWebsafeString(videoId);
+  const info = await yt.getBasicInfo(videoId, { client: 'YTMUSIC' });
+  const format = info.chooseFormat({ quality: 'best', type: 'audio' });
+  const decipheredUrl = await format.decipher(yt.session.player);
+  const url = `${decipheredUrl}&pot=${contentPoToken}`;
+
+  const res = await fetch(url, { headers: { 'user-agent': userAgent } });
+  if (!res.ok) {
+    throw new Error(`Stream fetch failed with status ${res.status}`);
+  }
+  return res.body;
 }
 
 async function playNext(guildId) {
@@ -167,12 +166,30 @@ async function playNext(guildId) {
 
   clearTimeout(session.idleTimer);
   const track = session.queue.shift();
-  session.ytProc?.kill();
+  session.stream?.destroy();
 
-  const ytProc = createYtDlpStream(track.url, guildId);
-  session.ytProc = ytProc;
+  let webStream;
+  try {
+    webStream = await getAudioStream(track.videoId);
+  } catch (err) {
+    console.error(`Failed to get audio stream for ${track.videoId}:`, err.message);
+    session.textChannel.send(`Failed to stream **${track.title}**, skipping.`).catch(() => {});
+    return playNext(guildId);
+  }
+
+  const stream = Readable.fromWeb(webStream);
+  stream.on('error', err => {
+    console.error(`Audio stream error for ${track.videoId}:`, err.message);
+    const s = sessions.get(guildId);
+    if (s && s.stream === stream) {
+      s.textChannel.send('Failed to stream that track, skipping.').catch(() => {});
+      playNext(guildId);
+    }
+  });
+
+  session.stream = stream;
   session.currentTrack = track;
-  session.player.play(createAudioResource(ytProc.stdout, { inputType: StreamType.Arbitrary }));
+  session.player.play(createAudioResource(stream, { inputType: StreamType.Arbitrary }));
 
   const msg = track.surprise
     ? 'Surprise song incoming! What could it be...'
@@ -223,7 +240,7 @@ async function getOrCreateSession(interaction, voiceChannel) {
       player,
       connection,
       queue: [],
-      ytProc: null,
+      stream: null,
       currentTrack: null,
       textChannel: interaction.channel,
       idleTimer: null
@@ -251,9 +268,14 @@ async function handleQueue(interaction, surprise) {
   await interaction.deferReply();
 
   try {
-    const target = resolveQuery(input);
-    const info = await getVideoInfo(target);
-    const track = { url: info.webpage_url, title: info.title, duration: info.duration, surprise };
+    const videoId = await resolveVideoId(input);
+    const info = await yt.getBasicInfo(videoId);
+    const track = {
+      videoId,
+      title: info.basic_info.title ?? 'Unknown title',
+      duration: info.basic_info.duration,
+      surprise,
+    };
     const session = await getOrCreateSession(interaction, voiceChannel);
     const isIdle = session.player.state.status === AudioPlayerStatus.Idle;
     session.queue.push(track);
@@ -320,7 +342,7 @@ client.on('interactionCreate', async interaction => {
       if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
         return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
       }
-      session.ytProc?.kill();
+      session.stream?.destroy();
       session.player.stop(true);
       return interaction.reply(`I'm very sorry :(((`);
     }
@@ -333,7 +355,7 @@ client.on('interactionCreate', async interaction => {
       const label = session.currentTrack?.surprise
         ? 'the surprise song'
         : `**${session.currentTrack?.title ?? 'current track'}**`;
-      session.ytProc?.kill();
+      session.stream?.destroy();
       session.player.stop(true);
       const suffix = session.queue.length > 0 ? '' : ' Queue is empty, disconnecting.';
       return interaction.reply(`Skipped ${label}.${suffix}`);
@@ -377,7 +399,7 @@ client.on('interactionCreate', async interaction => {
       clearTimeout(session.idleTimer);
       session.queue.length = 0;
       session.player.stop(true);
-      session.ytProc?.kill();
+      session.stream?.destroy();
       session.connection.destroy();
       sessions.delete(interaction.guildId);
       return interaction.reply('Stopped playback and disconnected.');
@@ -392,7 +414,7 @@ client.on('interactionCreate', async interaction => {
 	    const session = sessions.get(guildId);
 	    if (session) {
 	      clearTimeout(session.idleTimer);
-	      session.ytProc?.kill();
+	      session.stream?.destroy();
 	      session.player.stop(true);
 	      session.connection.destroy();
 	      sessions.delete(guildId);
@@ -400,4 +422,108 @@ client.on('interactionCreate', async interaction => {
 	  }
 	});
 
-	client.login(DISCORD_TOKEN);
+// YouTube requires a PO token to authorize actual media downloads (not just metadata).
+// This solves the BotGuard attestation challenge and mints one, mirroring bgutils-js's
+// own reference integration: https://github.com/LuanRT/BgUtils/blob/main/examples/index-innertube.ts
+async function initPoTokenMinter() {
+  try {
+    const { BotGuardClient } = await import('bgutils-js/botguard');
+    const { parseLooseJSON, buildURL, getHeaders, USER_AGENT } = await import('bgutils-js/utils');
+    const { WebPoMinter } = await import('bgutils-js/webpo');
+    const { JSDOM } = await import('jsdom');
+
+    userAgent = USER_AGENT;
+
+    const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
+      url: 'https://www.youtube.com',
+      referrer: 'https://www.youtube.com/',
+      userAgent: USER_AGENT,
+    });
+
+    const pageHtml = await (await fetch('https://www.youtube.com', {
+      headers: {
+        accept: '*/*',
+        'accept-language': 'en-US,en;q=0.7',
+        'user-agent': USER_AGENT,
+      },
+    })).text();
+
+    const ytConfig = pageHtml.match(/ytcfg\.set\(({.+?})\);/s)?.[1];
+    if (!ytConfig) {
+      throw new Error('Could not find ytcfg in YouTube homepage HTML.');
+    }
+    dom.window.yt = { config_: JSON.parse(ytConfig) };
+
+    Object.assign(globalThis, {
+      yt: dom.window.yt,
+      window: dom.window,
+      document: dom.window.document,
+      location: dom.window.location,
+      origin: dom.window.origin,
+    });
+    if (!('navigator' in globalThis)) {
+      Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator });
+    }
+
+    const initialAttestationData = pageHtml.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
+    if (!initialAttestationData) {
+      throw new Error('Could not find BotGuard challenge in YouTube homepage HTML.');
+    }
+    const challengeResponse = parseLooseJSON(initialAttestationData[1]).R;
+    if (!challengeResponse?.bgChallenge) {
+      throw new Error('Could not get BotGuard challenge.');
+    }
+
+    const interpreterUrl = challengeResponse.bgChallenge.interpreterUrl.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+    const interpreterJavascript = await (await fetch(`https:${interpreterUrl}`)).text();
+    if (!interpreterJavascript) {
+      throw new Error('Could not load BotGuard VM.');
+    }
+    new Function(interpreterJavascript)();
+
+    const botGuardClient = await BotGuardClient.create({
+      program: challengeResponse.bgChallenge.program,
+      globalName: challengeResponse.bgChallenge.globalName,
+      globalObject: globalThis,
+    });
+
+    const requestKey = 'O43z0dpjhgX20SCx4KAo';
+    const webPoSignalOutput = [];
+    const botguardResponse = await botGuardClient.snapshot({ webPoSignalOutput });
+
+    const integrityTokenResponse = await fetch(buildURL('GenerateIT', true), {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify([requestKey, botguardResponse]),
+    });
+    const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = await integrityTokenResponse.json();
+
+    webPoMinter = await WebPoMinter.create(
+      { integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken },
+      webPoSignalOutput
+    );
+
+    console.log('PO token minter ready.');
+  } catch (err) {
+    console.error('Failed to initialize PO token minter (streaming will fail until this recovers):', err.message);
+  }
+}
+
+async function main() {
+  const youtubei = await import('youtubei.js');
+  // youtubei.js ships no JS interpreter of its own; this is needed to decipher signed stream URLs.
+  youtubei.Platform.shim.eval = async data => new Function(data.output)();
+  yt = await youtubei.Innertube.create({ generate_session_locally: true });
+  YTNodes = youtubei.YTNodes;
+
+  await initPoTokenMinter();
+  // The integrity token expires (~12h); refresh well before that so long-running uptime doesn't degrade.
+  setInterval(() => initPoTokenMinter(), 6 * 60 * 60 * 1000);
+
+  client.login(DISCORD_TOKEN);
+}
+
+main().catch(err => {
+  console.error('Failed to initialize YouTube client:', err);
+  process.exit(1);
+});
