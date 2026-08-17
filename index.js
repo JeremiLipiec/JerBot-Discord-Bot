@@ -71,11 +71,29 @@ async function getVideoInfo(target) {
   return result.entries?.[0] ?? result;
 }
 
-function createYtDlpStream(url) {
-  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--quiet', '--js-runtimes', 'node', '--remote-components', 'ejs:github']);
+function createYtDlpStream(url, guildId) {
+  const proc = spawn('yt-dlp', [url, '-f', 'bestaudio', '--no-playlist', '-o', '-', '--js-runtimes', 'node', '--remote-components', 'ejs:github']);
   proc.on('error', err => {
     console.error('yt-dlp process error:', err.message);
   });
+
+  let stderr = '';
+  proc.stderr.on('data', chunk => {
+    stderr += chunk;
+  });
+
+  proc.on('exit', (code, signal) => {
+    // code is null when we killed it ourselves (skip/stop/track change) - that's not a failure
+    if (code === 0 || code === null) return;
+    console.error(`yt-dlp stream for ${url} exited with code ${code}:\n${stderr.trim()}`);
+
+    const session = sessions.get(guildId);
+    if (session && session.ytProc === proc) {
+      session.textChannel.send('Failed to stream that track, skipping.').catch(() => {});
+      playNext(guildId);
+    }
+  });
+
   return proc;
 }
 
@@ -151,7 +169,7 @@ async function playNext(guildId) {
   const track = session.queue.shift();
   session.ytProc?.kill();
 
-  const ytProc = createYtDlpStream(track.url);
+  const ytProc = createYtDlpStream(track.url, guildId);
   session.ytProc = ytProc;
   session.currentTrack = track;
   session.player.play(createAudioResource(ytProc.stdout, { inputType: StreamType.Arbitrary }));
