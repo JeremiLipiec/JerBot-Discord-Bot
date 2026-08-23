@@ -141,13 +141,46 @@ async function getAudioStream(videoId) {
   const info = await yt.getBasicInfo(videoId, { client: 'YTMUSIC' });
   const format = info.chooseFormat({ quality: 'best', type: 'audio' });
   const decipheredUrl = await format.decipher(yt.session.player);
-  const url = `${decipheredUrl}&pot=${contentPoToken}`;
+  const baseUrl = `${decipheredUrl}&pot=${contentPoToken}`;
+  const totalBytes = format.content_length;
 
-  const res = await fetch(url, { headers: { 'user-agent': userAgent } });
-  if (!res.ok) {
-    throw new Error(`Stream fetch failed with status ${res.status}`);
+  // youtubei.js's own internal downloader never does a single plain fetch for
+  // audio-only formats - it always pages through the file in chunks via a
+  // "&range=start-end" query param (not an HTTP Range header). A single unranged
+  // fetch only gets the CDN's default truncated initial chunk, not the full track.
+  const CHUNK_SIZE = 1048576 * 10; // 10MB, matches youtubei.js's own chunk size
+  const chunks = [];
+  let start = 0;
+
+  while (!totalBytes || start < totalBytes) {
+    const end = start + CHUNK_SIZE;
+
+    // A stalled connection (as opposed to a cleanly closed one) would otherwise hang
+    // this forever with no error - abort it so a stall fails loudly instead of
+    // silently jamming the guild's playback.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error('Timed out downloading audio.')), 30_000);
+
+    try {
+      const res = await fetch(`${baseUrl}&range=${start}-${end}`, {
+        headers: { 'user-agent': userAgent },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`Stream fetch failed with status ${res.status}`);
+      }
+      const chunk = Buffer.from(await res.arrayBuffer());
+      if (chunk.length === 0) break;
+      chunks.push(chunk);
+      start = end + 1;
+      // No known total size: a short read means the server has nothing left to send.
+      if (!totalBytes && chunk.length < CHUNK_SIZE) break;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
-  return res.body;
+
+  return Readable.from(Buffer.concat(chunks));
 }
 
 async function playNext(guildId) {
@@ -168,16 +201,15 @@ async function playNext(guildId) {
   const track = session.queue.shift();
   session.stream?.destroy();
 
-  let webStream;
+  let stream;
   try {
-    webStream = await getAudioStream(track.videoId);
+    stream = await getAudioStream(track.videoId);
   } catch (err) {
     console.error(`Failed to get audio stream for ${track.videoId}:`, err.message);
     session.textChannel.send(`Failed to stream **${track.title}**, skipping.`).catch(() => {});
     return playNext(guildId);
   }
 
-  const stream = Readable.fromWeb(webStream);
   stream.on('error', err => {
     console.error(`Audio stream error for ${track.videoId}:`, err.message);
     const s = sessions.get(guildId);
