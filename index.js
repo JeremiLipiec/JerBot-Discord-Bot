@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, MessageFlags } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -132,14 +132,32 @@ function scheduleIdleDisconnect(guildId) {
   }
 }
 
+// YTMUSIC only exposes streaming formats for content YouTube Music actually carries;
+// non-music videos (movie clips, VODs, etc.) come back with no streaming data at all.
+// Fall back to IOS, which serves formats for regular videos too.
+const STREAM_CLIENTS = ['YTMUSIC', 'IOS'];
+
+async function chooseFormatWithFallback(videoId) {
+  let lastErr;
+  for (const client of STREAM_CLIENTS) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+      return info.chooseFormat({ quality: 'best', type: 'audio' });
+    } catch (err) {
+      lastErr = err;
+      if (err?.info?.error_type !== 'NO_STREAMING_DATA') throw err;
+    }
+  }
+  throw lastErr;
+}
+
 async function getAudioStream(videoId) {
   if (!webPoMinter) {
     throw new Error('PO token minter is not ready.');
   }
 
   const contentPoToken = await webPoMinter.mintAsWebsafeString(videoId);
-  const info = await yt.getBasicInfo(videoId, { client: 'YTMUSIC' });
-  const format = info.chooseFormat({ quality: 'best', type: 'audio' });
+  const format = await chooseFormatWithFallback(videoId);
   const decipheredUrl = await format.decipher(yt.session.player);
   const baseUrl = `${decipheredUrl}&pot=${contentPoToken}`;
   const totalBytes = format.content_length;
@@ -152,32 +170,43 @@ async function getAudioStream(videoId) {
   const chunks = [];
   let start = 0;
 
+  const MAX_CHUNK_ATTEMPTS = 3;
+
   while (!totalBytes || start < totalBytes) {
     const end = start + CHUNK_SIZE;
+    let chunk;
 
-    // A stalled connection (as opposed to a cleanly closed one) would otherwise hang
-    // this forever with no error - abort it so a stall fails loudly instead of
-    // silently jamming the guild's playback.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error('Timed out downloading audio.')), 30_000);
+    for (let attempt = 1; ; attempt++) {
+      // A stalled connection (as opposed to a cleanly closed one) would otherwise hang
+      // this forever with no error - abort it so a stall fails loudly instead of
+      // silently jamming the guild's playback.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(new Error('Timed out downloading audio.')), 30_000);
 
-    try {
-      const res = await fetch(`${baseUrl}&range=${start}-${end}`, {
-        headers: { 'user-agent': userAgent },
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        throw new Error(`Stream fetch failed with status ${res.status}`);
+      try {
+        const res = await fetch(`${baseUrl}&range=${start}-${end}`, {
+          headers: { 'user-agent': userAgent },
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          throw new Error(`Stream fetch failed with status ${res.status}`);
+        }
+        chunk = Buffer.from(await res.arrayBuffer());
+        break;
+      } catch (err) {
+        // Transient stalls/network blips are common on long tracks; retry a few
+        // times before giving up on the whole download.
+        if (attempt >= MAX_CHUNK_ATTEMPTS) throw err;
+      } finally {
+        clearTimeout(timeout);
       }
-      const chunk = Buffer.from(await res.arrayBuffer());
-      if (chunk.length === 0) break;
-      chunks.push(chunk);
-      start = end + 1;
-      // No known total size: a short read means the server has nothing left to send.
-      if (!totalBytes && chunk.length < CHUNK_SIZE) break;
-    } finally {
-      clearTimeout(timeout);
     }
+
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    start = end + 1;
+    // No known total size: a short read means the server has nothing left to send.
+    if (!totalBytes && chunk.length < CHUNK_SIZE) break;
   }
 
   return Readable.from(Buffer.concat(chunks));
@@ -294,7 +323,7 @@ async function handleQueue(interaction, surprise) {
   const voiceChannel = interaction.member?.voice?.channel;
 
   if (!voiceChannel) {
-    return interaction.reply({ content: 'You need to join a voice channel first!', ephemeral: true });
+    return interaction.reply({ content: 'You need to join a voice channel first!', flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply();
@@ -355,7 +384,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
     return interaction.reply({
       content: 'This command can only be used in the designated music channel.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -372,7 +401,7 @@ client.on('interactionCreate', async interaction => {
     case 'spierdalaj': {
       const session = sessions.get(interaction.guildId);
       if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
-        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is currently playing.', flags: MessageFlags.Ephemeral });
       }
       session.stream?.destroy();
       session.player.stop(true);
@@ -382,7 +411,7 @@ client.on('interactionCreate', async interaction => {
     case 'skip': {
       const session = sessions.get(interaction.guildId);
       if (!session || session.player.state.status === AudioPlayerStatus.Idle) {
-        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is currently playing.', flags: MessageFlags.Ephemeral });
       }
       const label = session.currentTrack?.surprise
         ? 'the surprise song'
@@ -397,13 +426,13 @@ client.on('interactionCreate', async interaction => {
       const session = sessions.get(interaction.guildId);
       const status = session?.player.state.status;
       if (!session || status === AudioPlayerStatus.Idle) {
-        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is currently playing.', flags: MessageFlags.Ephemeral });
       }
       if (status === AudioPlayerStatus.Paused) {
-        return interaction.reply({ content: 'Playback is already paused.', ephemeral: true });
+        return interaction.reply({ content: 'Playback is already paused.', flags: MessageFlags.Ephemeral });
       }
       if (!session.player.pause()) {
-        return interaction.reply({ content: 'Could not pause right now, try again in a moment.', ephemeral: true });
+        return interaction.reply({ content: 'Could not pause right now, try again in a moment.', flags: MessageFlags.Ephemeral });
       }
       return interaction.reply('Paused playback.');
     }
@@ -412,13 +441,13 @@ client.on('interactionCreate', async interaction => {
       const session = sessions.get(interaction.guildId);
       const status = session?.player.state.status;
       if (!session || status === AudioPlayerStatus.Idle) {
-        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is currently playing.', flags: MessageFlags.Ephemeral });
       }
       if (status !== AudioPlayerStatus.Paused) {
-        return interaction.reply({ content: 'Playback is already playing.', ephemeral: true });
+        return interaction.reply({ content: 'Playback is already playing.', flags: MessageFlags.Ephemeral });
       }
       if (!session.player.unpause()) {
-        return interaction.reply({ content: 'Could not resume right now, try again in a moment.', ephemeral: true });
+        return interaction.reply({ content: 'Could not resume right now, try again in a moment.', flags: MessageFlags.Ephemeral });
       }
       return interaction.reply('Resumed playback.');
     }
@@ -426,7 +455,7 @@ client.on('interactionCreate', async interaction => {
     case 'stop': {
       const session = sessions.get(interaction.guildId);
       if (!session) {
-        return interaction.reply({ content: 'Nothing is currently playing.', ephemeral: true });
+        return interaction.reply({ content: 'Nothing is currently playing.', flags: MessageFlags.Ephemeral });
       }
       clearTimeout(session.idleTimer);
       session.queue.length = 0;
